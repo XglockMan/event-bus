@@ -7,6 +7,7 @@ use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::any::{TypeId, Any};
+use crate::EventResult::{EvCancelled, EvError, EvPassed};
 
 #[macro_export]
 macro_rules! subscribe_event {
@@ -40,6 +41,7 @@ lazy_static! {
 }
 
 pub trait Event: 'static {
+
     fn cancellable(&self) -> bool {
         false
     }
@@ -48,13 +50,18 @@ pub trait Event: 'static {
         false
     }
 
-    fn set_cancelled(&mut self, _cancel: bool) {
+    fn get_cancelled_reason(&self) -> Option<String> {
+        panic!("Cancel reason feature is not implemented");
+    }
+
+    fn set_cancelled(&mut self, _cancel: bool, reason: Option<String>) {
         panic!("Cannot cancel event that is not cancellable!");
     }
 
-    fn cancel(&mut self) {
-        self.set_cancelled(true);
+    fn cancel(&mut self, reason: Option<String>) {
+        self.set_cancelled(true, reason);
     }
+
 }
 
 pub struct EventBus {
@@ -97,7 +104,15 @@ impl Drop for EventBus {
     }
 }
 
-pub fn dispatch_event<T: Event>(bus: &str, event: &mut T) {
+#[derive(PartialEq)]
+#[derive(Debug)]
+pub enum EventResult {
+    EvPassed,
+    EvCancelled(String),
+    EvError
+}
+
+pub fn dispatch_event<T: Event>(bus: &str, event: &mut T) -> EventResult {
     let event_id = get_event_id::<T>();
     let map = EVENT_HANDLER_MAP.read()
         .expect("Failed to get read guard on handler map");
@@ -114,12 +129,25 @@ pub fn dispatch_event<T: Event>(bus: &str, event: &mut T) {
                 handler.1(event);
 
                 if cancellable && event.cancelled() {
-                    break;
+
+                    let reason: Option<String> = event.get_cancelled_reason();
+
+                    if reason.is_none() {
+                        return EvCancelled("Reason msg is not specified".to_string());
+                    }
+
+                    return EvCancelled(reason.unwrap());
                 }
             }
+
+            return EvPassed;
         }
+
+        EvError
+
     } else {
         warn!("Cannot dispatch event on invalid bus: '{}'", bus);
+        EvError
     }
 }
 
@@ -155,4 +183,75 @@ fn get_event_id<T: Event>() -> usize {
         .entry(TypeId::of::<T>()).or_insert_with(||
             EVENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestEvent {
+        cancelled: bool,
+        reason: Option<String>
+    }
+
+    impl TestEvent {
+
+        fn new() -> Self {
+            Self {
+                cancelled: false,
+                reason: None
+            }
+        }
+
+    }
+
+    impl Event for TestEvent {
+
+        fn cancellable(&self) -> bool {
+            true
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled
+        }
+
+        fn get_cancelled_reason(&self) -> Option<String> {
+            self.reason.clone()
+        }
+
+        fn set_cancelled(&mut self, _cancel: bool, reason: Option<String>) {
+            self.cancelled = _cancel;
+
+            if reason.is_some() {
+                self.reason = reason;
+            }
+        }
+    }
+
+    fn test_handle(event: &mut TestEvent) {}
+
+    fn test_handle_cancel(event: &mut TestEvent) {
+        event.cancel(Option::from("Test cancel reason".to_string()));
+    }
+
+    #[test]
+    fn call_test() {
+
+        let bus = EventBus::new("test");
+
+        subscribe_event!("test", test_handle);
+
+        let mut test_event = TestEvent::new();
+
+        let result: EventResult = dispatch_event!("test", &mut test_event);
+
+        assert_eq!(result, EvPassed);
+
+        subscribe_event!("test", test_handle_cancel);
+
+        let result_cancelled: EventResult = dispatch_event!("test", &mut test_event);
+
+        assert_eq!(result_cancelled, EvCancelled(String::from("Test cancel reason")));
+    }
+
 }
